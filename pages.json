@@ -1,0 +1,52 @@
+{
+	"pages": [
+		{
+			"path": "pages/index/index",
+			"style": {
+				"navigationStyle": "custom",
+				"navigationBarTextStyle": "white",
+				"app-plus": {
+					"titleNView": false
+				}
+			}
+		},
+		{
+			"path": "pages/playlist/playlist",
+			"style": {
+				"navigationStyle": "custom",
+				"navigationBarTextStyle": "white",
+				"app-plus": {
+					"titleNView": false
+				}
+			}
+		}
+	],
+	"globalStyle": {
+		"navigationBarTextStyle": "white",
+		"navigationBarTitleText": "My Music",
+		"navigationBarBackgroundColor": "#010102",
+		"backgroundColor": "#010102",
+		"app-plus": {
+			"background": "#010102"
+		}
+	},
+	"tabBar": {
+		"color": "#8a8f98",
+		"selectedColor": "#f7f8f8",
+		"backgroundColor": "#010102",
+		"borderStyle": "black",
+		"height": "55px",
+		"fontSize": "14px",
+		"list": [
+			{
+				"pagePath": "pages/index/index",
+				"text": "播放"
+			},
+			{
+				"pagePath": "pages/playlist/playlist",
+				"text": "列表"
+			}
+		]
+	},
+	"uniIdRouter": {}
+}
