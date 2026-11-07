@@ -198,7 +198,7 @@ HBuilderX → 发行 → 原生 App-云打包 / 小程序-微信。输出目录 
 
 #### 复制目录与命名
 
-- 目标目录：`context.getExternalFilesDir(null)/audio`，失败回退 `context.getFilesDir()`。
+- 目标目录：`plus.io.convertLocalFileSystemURL('_doc/') + 'audio/'`（应用私有文档目录），拿不到时回退 `context.getFilesDir()` 的绝对路径。
 - **绝对不要用 `getCacheDir()`**：系统随时清理，歌单会一夜之间全变「播放失败」。
 - 文件名：`hashString(uriStr) + '_' + 清洗后的原名 + '.' + 扩展名`，扩展名从 `_display_name` 取，取不到按 mime 映射。
 - **绝对不要直接拿 `_display_name` 当文件名**：不同目录下同名的 `01.mp3` 会命中同一份缓存，播放时放的是别人的歌。
@@ -207,21 +207,59 @@ HBuilderX → 发行 → 原生 App-云打包 / 小程序-微信。输出目录 
 
 > 代价：导入后文件会存两份（原文件 + 应用副本），存储占用翻倍。这是用空间换「重启后一定能播」的确定性，改策略前先确认能接受。
 
-#### URI 形态与解析规则
+#### 5+ 运行时桥接的坑（踩过两次，务必遵守）
+
+`plus.android` 对「JS 值 ↔ Java 对象」的转换只覆盖一部分情况，写错不会报错，只会**静默抛异常被 catch 掉**，表现就是「功能默默不生效」。
+
+**规则一：构造 Java 对象时只用字符串 / 数字，不要把桥接对象当构造参数。**
+
+```js
+// ❌ 真机上静默失败（File 对象当参数）
+const dir = new File(context.getExternalFilesDir(null), 'audio')
+const fos = new FileOutputStream(new File(dir, name))
+
+// ✅ 只用字符串路径
+const dirPath = plus.io.convertLocalFileSystemURL('_doc/') + 'audio/'
+const dir = new File(dirPath)
+const fos = new FileOutputStream(dirPath + fileName)
+```
+
+**规则二：静态方法用「类名.方法」，不要 `plus.android.invoke(类对象, ...)`。**
+
+```js
+// ❌
+const parsed = plus.android.invoke(Uri, 'parse', uriStr)
+// ✅
+const parsed = Uri.parse(uriStr)
+```
+
+**规则三：桥接对象当「方法参数」是安全的**（与构造参数不同），例如 `plus.android.invoke(input, 'transferTo', fos)`、`plus.android.invoke(resolver, 'query', parsedUri, ...)`。
+
+**规则四：`InputStream.transferTo` 是 Android 8.0（API 26）才有的方法**，必须留兜底：
+
+```js
+const Channels = plus.android.importClass('java.nio.channels.Channels')
+const ByteBuffer = plus.android.importClass('java.nio.ByteBuffer')
+const srcChannel = plus.android.invoke(Channels, 'newChannel', input)  // 分块 64KB
+```
+
+**规则五：任何原生操作失败都要记录原因并显示给用户**，禁止空的 `catch (e) {}` 把错误吞掉——本项目为此专门加了 `getLastCopyError()`，导入失败会弹窗显示原因。
+
+#### 复制实现的降级顺序
+
+1. `resolver.openInputStream(uri)` + `transferTo(fos)`（Android 8.0+，最快）；
+2. 失败 → `Channels.newChannel(input)` + `ByteBuffer` 分块搬运（老系统兜底）；
+3. 都失败 → 返回 `null` 并 `setError()` 记录原因，**绝不把空文件留下**。
+
+复制完成后必须校验 `File.length() > 0`，为 0 就删掉并返回 `null`，否则会得到一个「存在但播不了」的幽灵文件。
+
+#### URI 形态与解析规则（`resolveContentUriPath`，只用于读元数据）
 
 | URI 形态 | 解析方式 |
 |----------|----------|
 | `com.android.externalstorage.documents/document/primary:Music/a.mp3` | 拼 `/storage/emulated/0/Music/a.mp3`；非 primary 拼 `/storage/<volume>/...` |
 | `com.android.providers.media.documents/document/audio:123` | 查 MediaStore `_data`，再退 `relative_path + _display_name` |
 | `com.android.providers.downloads.documents/document/123` | 查 `content://downloads/public_downloads` 的 `_data` |
-
-#### 复制实现的三级降级（不要简化成一种）
-
-1. `resolver.openInputStream(uri).transferTo(fos)`（最快，Android 10+）；
-2. 失败 → `openFileDescriptor` + `FileChannel.transferTo`（兼容 CloudProvider / 部分 ROM）；
-3. 再失败 → `BufferedInputStream` 逐字节 `read/write`（最慢但最保险）。
-
-复制完成后必须校验 `File.length() > 0`，为 0 就删掉并返回 `null`，否则会得到一个「能播但没声音」的幽灵文件。
 
 #### 持久化授权
 
@@ -235,8 +273,10 @@ HBuilderX → 发行 → 原生 App-云打包 / 小程序-微信。输出目录 
   - **请求码不匹配时必须把回调交还给旧处理器**，不能直接 return（否则会吞掉别的插件/Activity 的结果）；
   - 用 `_isPicking` 防止重复打开；
   - 任何分支都要走 `finishPicking()` 清理全局回调，避免回调跨页面串台。
-- 元数据读取用 `MediaMetadataRetriever`，三级 fallback：真实路径 → `setDataSource(context, uri)` → `openAssetFileDescriptor` → `uriStr`。读不到就回退文件名当标题，**不允许因为标签缺失而丢歌**。
+- 元数据读取用 `MediaMetadataRetriever`，**只从应用私有副本读取**（副本一定是可直接访问的文件路径）。读不到就回退文件名当标题，**不允许因为标签缺失而丢歌**。
 - 新增的歌曲统一带 `uri` 字段；`addSongsAt()` 以 `path` 或 `uri` 去重。
+- **复制失败就跳过该文件，不要入库**。导入结束后若存在失败，用 `uni.showModal` 明确告诉用户「成功 N 首 / 失败 M 首 + 原因（`getLastCopyError()`）」，不要静默吞掉。
+- 批量导入期间用 `uni.showLoading('正在导入 i/total')` 给反馈，结束后必须 `uni.hideLoading()`。
 
 ### 5.5 歌单与持久化
 
@@ -308,9 +348,37 @@ HBuilderX → 发行 → 原生 App-云打包 / 小程序-微信。输出目录 
 ```
 
 - 两次都要跑：只跑 H5 会漏掉 `#ifdef APP-PLUS` 分支里的语法错误，只跑 App 会漏掉普通分支。
-- 日志关键字：`[content-uri]`（URI 解析/复制）、`[play]`（播放路径决策）、`音频播放错误`（含路径）。
-- 真机排查顺序：确认 `song.uri` 是否存在 → 看 `[content-uri]` 是否走了 copy → 检查应用私有目录 `Android/data/<包名>/files/audio` 下有没有文件、大小是否正常 → 再看 `getExternalFilesDir` 是否被 ROM 限制。
-- **打包限制**：`static/` 及项目内任何文件名不能含中文或全角字符，否则 App 导出直接失败（`科羽音乐_Logo标志.png` 曾导致打包失败，已改名为 `keyu-logo.png`）。
+- 日志关键字：`[content-uri]`（复制/解析）、`[play]`（播放路径决策）、`[file-picker]`（跳过的文件）、`音频播放错误`（含 uri 与 path）。
+- 真机排查顺序：确认 `song.uri` 是否存在 → 看 `[content-uri]` 是否报了复制失败 → **检查副本目录里有没有文件**（见下）→ 再看 ROM 是否限制了应用私有目录。
+
+#### 真机排查：adb 直接看目录（最有效）
+
+```bash
+ADB="D:\HBuilderX.5.01.2026021122-alpha\HBuilderX\plugins\launcher-tools\tools\adbs\adb.exe"
+
+# 1. 确认设备与系统版本（scoped storage 行为差别很大）
+"$ADB" devices -l
+"$ADB" shell getprop ro.build.version.release
+
+# 2. 确认装的是哪个版本
+"$ADB" shell "dumpsys package uni.app.UNI584E088 | grep -E 'versionName|versionCode'"
+
+# 3. 看副本到底落没落盘（正式包 / 调试基座路径不同）
+"$ADB" shell "ls -l /sdcard/Android/data/uni.app.UNI584E088/apps/__UNI__584E088/doc/audio/"
+"$ADB" shell "ls -l /sdcard/Android/data/io.dcloud.HBuilder/apps/HBuilder/doc/audio/"
+
+# 4. 抓我们自己的日志
+"$ADB" logcat -d -t 4000 | grep -E "content-uri|\[play\]|file-picker"
+
+# 5. 直接覆盖安装新包（同一个云端证书，签名一致）
+"$ADB" install -r D:\path\to\keyu-music.apk
+```
+
+**关键判据：目录存在但里面是空的 = 复制那一步失败了**（本项目 v1.0.1 就是这么定位的）。目录建出来只能说明 `mkdirs` 成功，不能说明文件写成功。
+
+- 正式包路径：`/sdcard/Android/data/uni.app.UNI584E088/apps/__UNI__584E088/doc/audio/`
+- 调试基座路径：`/sdcard/Android/data/io.dcloud.HBuilder/apps/HBuilder/doc/audio/`
+- **打包限制**：`static/` 及项目内任何文件名不能含中文或全角字符，否则 App 导出直接失败（`科羽音乐_Logo标志.png` 曾导致打包失败，已改名为 `keyu-logo.png`）。运行时生成的中文文件名（如副本名）不受此限制。
 
 ### 5.10 改音频代码前的检查清单
 
@@ -320,10 +388,27 @@ HBuilderX → 发行 → 原生 App-云打包 / 小程序-微信。输出目录 
 - [ ] 新导入的歌曲 `path` 是否指向应用私有副本（而不是原始共享路径）？
 - [ ] 拿到 `null` 路径时是否按「文件失效」处理，而不是硬播？
 - [ ] 有没有重复实现 content:// 解析（应调用 `content-uri.js`）？
+- [ ] Java 对象是否只用字符串/数字构造？失败分支有没有留下可读的错误原因？
 - [ ] `_next` 的 `auto` 语义是否保持（自动 vs 手动）？
 - [ ] 新增事件是否在 `_removeListeners()` 里配套 `off`？
 - [ ] H5 与 App 两种条件编译都编译过？
 - [ ] 清缓存/杀进程/锁屏三种场景有没有考虑？
+
+### 5.11 故障复盘（别再踩同样的坑）
+
+| 现象 | 根因 | 修复 |
+|------|------|------|
+| 添加音乐后当场能播，彻底退出进程再进来**全部播放失败** | 导入时存了共享存储上的原路径，其可读性依赖 SAF 的**进程级临时授权**，进程一死就失效 | 导入即复制到应用私有目录，播放只认副本（`bc59234`） |
+| 修复后变成**添加即提示「文件已失效」** | 复制实现用了 `new File(File对象, 名称)`、`new FileOutputStream(File对象)`、`plus.android.invoke(Uri,'parse',…)`，真机上静默抛异常 | 全程改成字符串路径 + `Uri.parse()` 静态调用 + 失败原因上抛（`236b80e`） |
+| 不同目录下同名 `01.mp3` 会**播成别人的歌** | 副本直接拿 `_display_name` 当文件名，撞名后命中同一份缓存 | 文件名加 URI 哈希前缀 |
+| 单曲循环时「下一首」**点了没反应** | `next()` 里 `case 1: break` 后又 `play()` 当前曲 | `_next(auto)` 区分「自动结束」与「手动切歌」 |
+| App 打包直接失败，报「文件名不能含中文」 | `static/` 下有中文文件名 | 改为 ASCII 文件名 |
+
+**排查经验**：
+
+1. 先看副本目录有没有文件，再看日志——目录存在 ≠ 复制成功；
+2. 原生调用失败不要静默 catch，把原因透出到 UI；
+3. 涉及 content:// / 存储的地方，先在真机上验证「杀进程重进」这条路径，模拟器上常常不复现。
 
 ---
 
