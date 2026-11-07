@@ -158,8 +158,7 @@
 				playlistCount: 0,
 				playlistName: '默认歌单',
 				discGradient: 'linear-gradient(135deg, #5e6ad2, #828fff)',
-				_dragPercent: undefined,
-				_timeUpdater: null
+				_dragPercent: undefined
 			}
 		},
 		onLoad() {
@@ -170,7 +169,6 @@
 		},
 		onUnload() {
 			this._removeListeners()
-			if (this._timeUpdater) clearInterval(this._timeUpdater)
 		},
 		methods: {
 			_init() {
@@ -179,16 +177,7 @@
 				audioManager.on('playlistChange', this._onPlaylistChange)
 				audioManager.on('trackChange', this._onTrackChange)
 				audioManager.on('ready', this._onReady)
-
-				this._timeUpdater = setInterval(() => {
-					if (audioManager._ctx && audioManager.isPlaying) {
-						this.currentTime = audioManager.currentTime
-						this.duration = audioManager.duration
-						this.buffered = audioManager.buffered
-						this.progress = audioManager.getProgress()
-						this.bufferedPercent = this.duration > 0 ? (this.buffered / this.duration * 100) : 0
-					}
-				}, 250)
+				audioManager.on('timeUpdate', this._onTimeUpdate)
 			},
 
 			_removeListeners() {
@@ -196,6 +185,17 @@
 				audioManager.off('playlistChange', this._onPlaylistChange)
 				audioManager.off('trackChange', this._onTrackChange)
 				audioManager.off('ready', this._onReady)
+				audioManager.off('timeUpdate', this._onTimeUpdate)
+			},
+
+			_onTimeUpdate() {
+				// 拖动进度条时不被播放进度覆盖
+				if (this._dragPercent !== undefined) return
+				this.currentTime = audioManager.currentTime
+				this.duration = audioManager.duration
+				this.buffered = audioManager.buffered
+				this.progress = audioManager.getProgress()
+				this.bufferedPercent = this.duration > 0 ? (this.buffered / this.duration * 100) : 0
 			},
 
 			_onStateChange() {

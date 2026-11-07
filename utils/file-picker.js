@@ -1,8 +1,12 @@
 /**
  * 跨平台音频文件选择器
- * - APP-PLUS (Android): 使用 plus.android 原生文件选择器
+ * - APP-PLUS (Android): 使用 plus.android 原生文件选择器 + ID3 解析
  * - H5 / 小程序: 使用 uni.chooseFile
+ *
+ * content:// URI 的解析与落地统一由 content-uri.js 处理。
  */
+import { ensureLocalAudioFile } from './content-uri.js'
+
 export function pickAudioFiles(callback, errorCallback) {
 	// #ifdef APP-PLUS
 	pickAudioFilesNative(callback, errorCallback)
@@ -16,6 +20,7 @@ export function pickAudioFiles(callback, errorCallback) {
 			const files = (res.tempFiles || []).map(f => ({
 				path: f.path,
 				name: f.name || '',
+				uri: '',
 				size: f.size || 0
 			}))
 			callback && callback(files)
@@ -29,10 +34,15 @@ export function pickAudioFiles(callback, errorCallback) {
 }
 
 // #ifdef APP-PLUS
+const REQ_CODE = 99987
+
 let _pickCallback = null
 let _pickErrorCallback = null
+let _isPicking = false
 
 function pickAudioFilesNative(callback, errorCallback) {
+	if (_isPicking) return
+	_isPicking = true
 	_pickCallback = callback
 	_pickErrorCallback = errorCallback
 
@@ -46,7 +56,6 @@ function pickAudioFilesNative(callback, errorCallback) {
 		intent.addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
 		intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
 
-		const REQ_CODE = 99987
 		activity._oldOnActivityResult = activity.onActivityResult
 		activity.onActivityResult = function(requestCode, resultCode, intent) {
 			handleActivityResult(requestCode, resultCode, intent)
@@ -54,25 +63,42 @@ function pickAudioFilesNative(callback, errorCallback) {
 		activity.startActivityForResult(intent, REQ_CODE)
 	} catch (e) {
 		console.error('打开文件选择器失败:', e)
-		if (_pickErrorCallback) _pickErrorCallback(e)
-		_pickCallback = null
-		_pickErrorCallback = null
+		const errorCallback = _pickErrorCallback
+		finishPicking()
+		if (errorCallback) errorCallback(e)
 	}
+}
+
+function finishPicking() {
+	_isPicking = false
+	_pickCallback = null
+	_pickErrorCallback = null
 }
 
 function handleActivityResult(requestCode, resultCode, intent) {
 	const activity = plus.android.runtimeMainActivity()
+
+	if (requestCode !== REQ_CODE) {
+		// 其它 Activity 的回调交还给原来的处理逻辑
+		try {
+			if (activity._oldOnActivityResult) {
+				activity._oldOnActivityResult(requestCode, resultCode, intent)
+			}
+		} catch (e) {}
+		return
+	}
+
 	try {
 		activity.onActivityResult = activity._oldOnActivityResult || null
 	} catch (e) {}
 	activity._oldOnActivityResult = null
 
-	if (requestCode !== 99987) return
+	const callback = _pickCallback
+	const errorCallback = _pickErrorCallback
 
 	const Activity = plus.android.importClass('android.app.Activity')
 	if (resultCode !== Activity.RESULT_OK || !intent) {
-		_pickCallback = null
-		_pickErrorCallback = null
+		finishPicking()
 		return
 	}
 
@@ -94,27 +120,23 @@ function handleActivityResult(requestCode, resultCode, intent) {
 				} catch (e) {
 					item = plus.android.invoke(clipData, 'getItemAt', i)
 				}
-				const itemUri = plus.android.invoke(item, 'getUri')
-				takePersistablePermission(itemUri)
-				const info = resolveUriInfo(itemUri)
+				const info = resolveUriInfo(plus.android.invoke(item, 'getUri'))
 				if (info) files.push(info)
 			}
 		} else {
-			const itemUri = intent.getData()
-			if (itemUri) {
-				takePersistablePermission(itemUri)
-				const info = resolveUriInfo(itemUri)
+			const dataUri = intent.getData()
+			if (dataUri) {
+				const info = resolveUriInfo(dataUri)
 				if (info) files.push(info)
 			}
 		}
 
-		if (_pickCallback) _pickCallback(files)
+		if (callback) callback(files)
 	} catch (e) {
 		console.error('处理文件选择结果失败:', e)
-		if (_pickErrorCallback) _pickErrorCallback(e)
+		if (errorCallback) errorCallback(e)
 	}
-	_pickCallback = null
-	_pickErrorCallback = null
+	finishPicking()
 }
 
 function takePersistablePermission(uri) {
@@ -123,30 +145,30 @@ function takePersistablePermission(uri) {
 		const Intent = plus.android.importClass('android.content.Intent')
 		activity.getContentResolver().takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
 	} catch (e) {
-		// non-fatal
+		// 部分 provider 不支持持久授权，忽略即可
 	}
 }
 
 function resolveUriInfo(uri) {
+	const uriStr = typeof uri === 'string' ? uri : uri.toString()
+	let fileName = ''
+	let title = ''
+	let artist = ''
+	let album = ''
+	let duration = 0
+	let filePath = ''
+
 	try {
 		const activity = plus.android.runtimeMainActivity()
 		const resolver = activity.getContentResolver()
 		const context = activity.getApplicationContext()
 		const Uri = plus.android.importClass('android.net.Uri')
+		const parsedUri = typeof uri === 'string' ? Uri.parse(uri) : uri
 
-		if (typeof uri === 'string') {
-			uri = Uri.parse(uri)
-		}
-
-		let filePath = ''
-		let fileName = ''
-		let title = ''
-		let artist = ''
-		let album = ''
-		let duration = 0
+		takePersistablePermission(parsedUri)
 
 		try {
-			const cursor = resolver.query(uri, null, null, null, null)
+			const cursor = resolver.query(parsedUri, null, null, null, null)
 			if (cursor && cursor.moveToFirst()) {
 				const dataIdx = cursor.getColumnIndex('_data')
 				const nameIdx = cursor.getColumnIndex('_display_name')
@@ -154,25 +176,27 @@ function resolveUriInfo(uri) {
 				if (nameIdx >= 0) fileName = cursor.getString(nameIdx) || ''
 				cursor.close()
 			}
-		} catch (e) {
-			// fallback
-		}
+		} catch (e) {}
+
+		// 统一由 content-uri.js 决定「直接用真实路径」还是「复制到应用私有目录」
+		const local = ensureLocalAudioFile(uriStr)
+		if (local) filePath = local
 
 		try {
 			const MMR = plus.android.importClass('android.media.MediaMetadataRetriever')
 			const retriever = new MMR()
-			const uriStr = uri.toString()
+
 			if (filePath && filePath.indexOf('content://') !== 0) {
 				retriever.setDataSource(filePath)
 			} else {
 				let ok = false
 				try {
-					retriever.setDataSource(context, uri)
+					retriever.setDataSource(context, parsedUri)
 					ok = true
 				} catch (e1) {}
 				if (!ok) {
 					try {
-						const afd = resolver.openAssetFileDescriptor(uri, 'r')
+						const afd = resolver.openAssetFileDescriptor(parsedUri, 'r')
 						if (afd) {
 							retriever.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength())
 							afd.close()
@@ -180,12 +204,7 @@ function resolveUriInfo(uri) {
 						}
 					} catch (e2) {}
 				}
-				if (!ok) {
-					try {
-						retriever.setDataSource(uriStr)
-						ok = true
-					} catch (e3) {}
-				}
+				if (!ok) retriever.setDataSource(uriStr)
 			}
 
 			const t = retriever.extractMetadata(7)
@@ -199,46 +218,33 @@ function resolveUriInfo(uri) {
 
 			retriever.release()
 		} catch (e) {
-			// MediaMetadataRetriever failed, fallback to filename
-		}
-
-		if (!fileName) {
-			const uriStr = uri.toString()
-			const parts = uriStr.split('/')
-			fileName = decodeURIComponent(parts[parts.length - 1] || 'unknown.mp3')
-		}
-
-		if (!filePath) {
-			filePath = uri.toString()
-		}
-
-		if (!title) {
-			const dot = fileName.lastIndexOf('.')
-			title = dot > 0 ? fileName.substring(0, dot) : fileName
-		}
-
-		return {
-			path: filePath,
-			name: fileName,
-			title: title,
-			artist: artist || '未知艺术家',
-			album: album || '',
-			duration: duration,
-			size: 0
+			// 读不到标签就用文件名兜底
 		}
 	} catch (e) {
-		const uriStr = (typeof uri === 'string' ? uri : uri.toString())
-		const fallbackName = uriStr.split('/').pop() || 'unknown.mp3'
-		const dot = fallbackName.lastIndexOf('.')
-		return {
-			path: uriStr,
-			name: fallbackName,
-			title: dot > 0 ? fallbackName.substring(0, dot) : fallbackName,
-			artist: '未知艺术家',
-			album: '',
-			duration: 0,
-			size: 0
-		}
+		console.warn('解析音频信息失败:', e)
+	}
+
+	if (!fileName) {
+		const parts = uriStr.split('/')
+		fileName = decodeURIComponent(parts[parts.length - 1] || 'unknown.mp3')
+	}
+
+	if (!filePath) filePath = uriStr
+
+	if (!title) {
+		const dot = fileName.lastIndexOf('.')
+		title = dot > 0 ? fileName.substring(0, dot) : fileName
+	}
+
+	return {
+		path: filePath,
+		uri: uriStr,
+		name: fileName,
+		title: title,
+		artist: artist || '未知艺术家',
+		album: album || '',
+		duration: duration,
+		size: 0
 	}
 }
 // #endif

@@ -1,5 +1,8 @@
+﻿import { ensureLocalAudioFile } from './content-uri.js'
+
 const STORAGE_KEY = 'music_playlists'
 const STORAGE_ACTIVE_KEY = 'music_active_playlist'
+const STORAGE_MODE_KEY = 'music_play_mode'
 
 class AudioManager {
 	constructor() {
@@ -58,6 +61,10 @@ class AudioManager {
 			if (active !== '' && active !== null && active !== undefined && active >= 0 && active < this.playlists.length) {
 				this.activeIndex = parseInt(active)
 			}
+			const mode = parseInt(uni.getStorageSync(STORAGE_MODE_KEY))
+			if (mode === 1 || mode === 2) {
+				this.playMode = mode
+			}
 		} catch (e) {
 			this.playlists = [this._createBlank('默认歌单')]
 		}
@@ -67,6 +74,7 @@ class AudioManager {
 		try {
 			uni.setStorageSync(STORAGE_KEY, this.playlists)
 			uni.setStorageSync(STORAGE_ACTIVE_KEY, this.activeIndex)
+			uni.setStorageSync(STORAGE_MODE_KEY, this.playMode)
 		} catch (e) {}
 	}
 
@@ -121,12 +129,19 @@ class AudioManager {
 	// ===== 歌曲管理 =====
 
 	addSongs(files) {
-		const list = this.playlist
+		return this.addSongsAt(this.activeIndex, files)
+	}
+
+	addSongsAt(index, files) {
+		const pl = this.playlists[index]
+		if (!pl || !files || files.length === 0) return 0
+
 		const newSongs = files.filter(f => {
-			return !list.some(s => s.path === f.path)
+			return !pl.songs.some(s => s.path === f.path || (f.uri && s.uri === f.uri))
 		}).map((f, i) => ({
 			id: Date.now() + i,
 			path: f.path,
+			uri: f.uri || '',
 			title: f.title || this._extractTitle(f),
 			artist: f.artist || '未知艺术家',
 			album: f.album || '',
@@ -135,10 +150,9 @@ class AudioManager {
 		}))
 
 		if (newSongs.length > 0) {
-			const ap = this.activePlaylist
-			ap.songs.push(...newSongs)
-			if (ap.currentIndex === -1) {
-				ap.currentIndex = 0
+			pl.songs.push(...newSongs)
+			if (pl.currentIndex === -1) {
+				pl.currentIndex = 0
 			}
 			this._saveToStorage()
 			this._emit('playlistChange')
@@ -167,12 +181,44 @@ class AudioManager {
 		return true
 	}
 
+	removeSongAt(playlistIndex, songIndex) {
+		if (playlistIndex === this.activeIndex) {
+			return this.removeSong(songIndex)
+		}
+		const pl = this.playlists[playlistIndex]
+		if (!pl || songIndex < 0 || songIndex >= pl.songs.length) return false
+
+		pl.songs.splice(songIndex, 1)
+		if (pl.songs.length === 0) {
+			pl.currentIndex = -1
+		} else if (pl.currentIndex > songIndex) {
+			pl.currentIndex--
+		}
+
+		this._saveToStorage()
+		this._emit('playlistChange')
+		return true
+	}
+
 	clearCurrent() {
 		const ap = this.activePlaylist
 		if (!ap) return
 		ap.songs = []
 		ap.currentIndex = -1
 		this.stop()
+		this._saveToStorage()
+		this._emit('playlistChange')
+	}
+
+	clearPlaylistAt(index) {
+		if (index === this.activeIndex) {
+			this.clearCurrent()
+			return
+		}
+		const pl = this.playlists[index]
+		if (!pl) return
+		pl.songs = []
+		pl.currentIndex = -1
 		this._saveToStorage()
 		this._emit('playlistChange')
 	}
@@ -187,6 +233,10 @@ class AudioManager {
 		this._ctx = uni.createInnerAudioContext()
 		this._ctx.autoplay = false
 		try {
+			// playback 模式：App 切到后台仍然继续播放
+			this._ctx.sessionCategory = 'playback'
+		} catch (e) {}
+		try {
 			const v = uni.getStorageSync('music_volume')
 			if (v !== '' && v !== null && v !== undefined) {
 				this._ctx.volume = Math.max(0, Math.min(1, parseFloat(v) || 1))
@@ -199,6 +249,7 @@ class AudioManager {
 		})
 		this._ctx.onPlay(() => {
 			this.isPlaying = true
+			this._consecutiveErrors = 0
 			this._emit('stateChange')
 		})
 		this._ctx.onPause(() => {
@@ -211,18 +262,35 @@ class AudioManager {
 			this._emit('stateChange')
 		})
 		this._ctx.onEnded(() => {
-			this._next()
+			this._next(true)
 		})
 		this._ctx.onError((err) => {
-			console.error('音频播放错误:', err)
+			const curSong = this.getCurrentSong()
+			console.error('音频播放错误:', JSON.stringify(err), '路径:', curSong ? curSong.path : 'unknown')
 			this.isPlaying = false
 			this._emit('error', err)
+
+			const ap = this.activePlaylist
+			if (!ap || ap.songs.length <= 1) return
+			if (this.playMode === 1) return
+
+			this._consecutiveErrors = (this._consecutiveErrors || 0) + 1
+			if (this._consecutiveErrors >= ap.songs.length) {
+				this._consecutiveErrors = 0
+				uni.showToast({ title: '播放失败，请检查音频文件', icon: 'none', duration: 2000 })
+				return
+			}
+
+			setTimeout(() => {
+				this._next()
+			}, 300)
 		})
 		this._ctx.onTimeUpdate(() => {
 			if (this._ctx) {
 				this.currentTime = this._ctx.currentTime || 0
 				this.duration = this._ctx.duration || 0
 				this.buffered = this._ctx.buffered || 0
+				this._emit('timeUpdate')
 			}
 		})
 		this._ctx.onSeeked(() => {
@@ -235,10 +303,24 @@ class AudioManager {
 		if (!ap) return
 		if (index !== undefined && index >= 0 && index < ap.songs.length) {
 			ap.currentIndex = index
+			this._consecutiveErrors = 0
 		}
 		if (ap.currentIndex < 0 || ap.songs.length === 0) return
 
 		const song = ap.songs[ap.currentIndex]
+
+		// #ifdef APP-PLUS
+		const playable = ensureLocalAudioFile(song.uri || song.path)
+		if (playable) {
+			if (playable !== song.path) {
+				song.path = playable
+				this._saveToStorage()
+			}
+		} else {
+			console.warn('[play] 无法获取可播放路径:', song.uri || song.path)
+		}
+		// #endif
+
 		this._createContext()
 		this._ctx.src = song.path
 		this._ctx.play()
@@ -264,36 +346,28 @@ class AudioManager {
 		if (this._ctx) this._ctx.stop()
 	}
 
-	_next() {
+	/**
+	 * @param {boolean} auto 是否为「自然播放结束」触发
+	 * 单曲循环：自动结束时重播当前曲，手动点下一曲仍然切歌
+	 */
+	_next(auto) {
 		const ap = this.activePlaylist
 		if (!ap || ap.songs.length === 0) return
 
-		switch (this.playMode) {
-			case 1:
-				break
-			case 2:
-				ap.currentIndex = Math.floor(Math.random() * ap.songs.length)
-				break
-			default:
+		if (this.playMode === 1) {
+			if (!auto) {
 				ap.currentIndex = (ap.currentIndex + 1) % ap.songs.length
-				break
+			}
+		} else if (this.playMode === 2) {
+			ap.currentIndex = Math.floor(Math.random() * ap.songs.length)
+		} else {
+			ap.currentIndex = (ap.currentIndex + 1) % ap.songs.length
 		}
 		this.play()
 	}
 
 	next() {
-		const ap = this.activePlaylist
-		if (!ap || ap.songs.length === 0) return
-		switch (this.playMode) {
-			case 1: break
-			case 2:
-				ap.currentIndex = Math.floor(Math.random() * ap.songs.length)
-				break
-			default:
-				ap.currentIndex = (ap.currentIndex + 1) % ap.songs.length
-				break
-		}
-		this.play()
+		this._next(false)
 	}
 
 	prev() {
@@ -316,7 +390,24 @@ class AudioManager {
 
 	switchPlayMode() {
 		this.playMode = (this.playMode + 1) % 3
+		this._saveToStorage()
 		this._emit('modeChange')
+	}
+
+	/**
+	 * 释放播放器资源（停止播放并销毁音频上下文）
+	 */
+	release() {
+		this.stop()
+		if (this._ctx) {
+			this._ctx.destroy()
+			this._ctx = null
+		}
+		this.isPlaying = false
+		this.currentTime = 0
+		this.duration = 0
+		this.buffered = 0
+		this._emit('stateChange')
 	}
 
 	getCurrentSong() {

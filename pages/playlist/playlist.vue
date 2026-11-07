@@ -215,14 +215,7 @@
 					confirmColor: '#e17055',
 					success: (res) => {
 						if (res.confirm) {
-							const wasActive = this.tabIndex === audioManager.activeIndex
-							if (wasActive) {
-								audioManager.removeSong(si)
-							} else {
-								audioManager.playlists[this.tabIndex].songs.splice(si, 1)
-								audioManager._saveToStorage()
-								audioManager._emit('playlistChange')
-							}
+							audioManager.removeSongAt(this.tabIndex, si)
 							uni.showToast({ title: '已删除', icon: 'none' })
 						}
 					}
@@ -238,14 +231,7 @@
 					confirmColor: '#e17055',
 					success: (res) => {
 						if (res.confirm) {
-							if (this.tabIndex === audioManager.activeIndex) {
-								audioManager.clearCurrent()
-							} else {
-								audioManager.playlists[this.tabIndex].songs = []
-								audioManager.playlists[this.tabIndex].currentIndex = -1
-								audioManager._saveToStorage()
-								audioManager._emit('playlistChange')
-							}
+							audioManager.clearPlaylistAt(this.tabIndex)
 							uni.showToast({ title: '已清空', icon: 'none' })
 						}
 					}
@@ -257,26 +243,11 @@
 
 				pickAudioFiles((files) => {
 					if (files.length === 0) return
-
-					if (targetIdx === audioManager.activeIndex) {
-						const added = audioManager.addSongs(files)
+					const added = audioManager.addSongsAt(targetIdx, files)
+					if (added > 0) {
 						uni.showToast({ title: '已添加 ' + added + ' 首', icon: 'none' })
 					} else {
-						const newSongs = files.map((f, i) => ({
-							id: Date.now() + i,
-							path: f.path,
-							title: f.title || audioManager._extractTitle(f),
-							artist: f.artist || '未知艺术家',
-							album: f.album || '',
-							duration: f.duration || 0,
-							size: f.size || 0
-						}))
-						const pl = audioManager.playlists[targetIdx]
-						pl.songs.push(...newSongs)
-						if (pl.currentIndex === -1) pl.currentIndex = 0
-						audioManager._saveToStorage()
-						audioManager._emit('playlistChange')
-						uni.showToast({ title: '已添加 ' + newSongs.length + ' 首', icon: 'none' })
+						uni.showToast({ title: '歌曲已在列表中', icon: 'none' })
 					}
 				}, (err) => {
 					console.error('选择文件失败:', err)
@@ -312,16 +283,7 @@
 					confirmColor: '#e17055',
 					success: (res) => {
 						if (res.confirm) {
-							audioManager.stop()
-							if (audioManager._ctx) {
-								audioManager._ctx.destroy()
-								audioManager._ctx = null
-							}
-							audioManager.isPlaying = false
-							audioManager.currentTime = 0
-							audioManager.duration = 0
-							audioManager.buffered = 0
-							audioManager._emit('stateChange')
+							audioManager.release()
 							uni.showToast({ title: '缓存已清理', icon: 'none' })
 						}
 					}
@@ -552,18 +514,6 @@
 	.empty-hint {
 		font-size: 24rpx;
 		color: #62666d;
-	}
-
-	.empty-text {
-		font-size: 30rpx;
-		color: #6B6B6B;
-		margin-bottom: 8rpx;
-		font-weight: 500;
-	}
-
-	.empty-hint {
-		font-size: 24rpx;
-		color: rgba(107,107,107,0.5);
 	}
 
 	/* ===== 歌曲列表 ===== */
