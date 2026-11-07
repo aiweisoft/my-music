@@ -5,7 +5,7 @@
  *
  * content:// URI 的解析与落地统一由 content-uri.js 处理。
  */
-import { ensureLocalCopy, resolveContentUriPath } from './content-uri.js'
+import { ensureLocalCopy, getLastCopyError } from './content-uri.js'
 
 export function pickAudioFiles(callback, errorCallback) {
 	// #ifdef APP-PLUS
@@ -139,6 +139,19 @@ function handleActivityResult(requestCode, resultCode, intent) {
 
 		uni.hideLoading()
 		if (callback) callback(files)
+
+		const failed = total - files.length
+		if (failed > 0) {
+			// 把失败原因直接摆到用户面前，避免只能靠日志猜
+			setTimeout(() => {
+				uni.showModal({
+					title: failed === total ? '导入失败' : '部分文件导入失败',
+					content: (failed === total ? '' : '成功 ' + files.length + ' 首，失败 ' + failed + ' 首。\n') +
+						'原因：' + (getLastCopyError() || '未知'),
+					showCancel: false
+				})
+			}, 300)
+		}
 	} catch (e) {
 		uni.hideLoading()
 		console.error('处理文件选择结果失败:', e)
@@ -164,61 +177,35 @@ function resolveUriInfo(uri) {
 	let artist = ''
 	let album = ''
 	let duration = 0
-	let filePath = ''
 
 	try {
 		const activity = plus.android.runtimeMainActivity()
 		const resolver = activity.getContentResolver()
-		const context = activity.getApplicationContext()
 		const Uri = plus.android.importClass('android.net.Uri')
 		const parsedUri = typeof uri === 'string' ? Uri.parse(uri) : uri
 
 		takePersistablePermission(parsedUri)
 
+		// 一律复制到应用私有目录：这是唯一可靠的长期播放路径
+		const localPath = ensureLocalCopy(uriStr)
+		if (!localPath) {
+			console.warn('[file-picker] 复制失败，跳过该文件:', uriStr, getLastCopyError())
+			return null
+		}
+
 		try {
-			const cursor = resolver.query(parsedUri, null, null, null, null)
-			if (cursor && cursor.moveToFirst()) {
-				const dataIdx = cursor.getColumnIndex('_data')
-				const nameIdx = cursor.getColumnIndex('_display_name')
-				if (dataIdx >= 0) filePath = cursor.getString(dataIdx) || ''
-				if (nameIdx >= 0) fileName = cursor.getString(nameIdx) || ''
-				cursor.close()
+			const cursor = plus.android.invoke(resolver, 'query', parsedUri, null, null, null, null)
+			if (cursor && plus.android.invoke(cursor, 'moveToFirst')) {
+				const nameIdx = plus.android.invoke(cursor, 'getColumnIndex', '_display_name')
+				if (nameIdx >= 0) fileName = plus.android.invoke(cursor, 'getString', nameIdx) || ''
+				plus.android.invoke(cursor, 'close')
 			}
 		} catch (e) {}
-
-		// 一律复制到应用私有目录：副本只依赖应用自身存储，重启后依然可播
-		const local = ensureLocalCopy(uriStr)
-		if (local) {
-			filePath = local
-		} else {
-			const resolved = resolveContentUriPath(uriStr)
-			if (resolved) filePath = resolved
-		}
 
 		try {
 			const MMR = plus.android.importClass('android.media.MediaMetadataRetriever')
 			const retriever = new MMR()
-
-			if (filePath && filePath.indexOf('content://') !== 0) {
-				retriever.setDataSource(filePath)
-			} else {
-				let ok = false
-				try {
-					retriever.setDataSource(context, parsedUri)
-					ok = true
-				} catch (e1) {}
-				if (!ok) {
-					try {
-						const afd = resolver.openAssetFileDescriptor(parsedUri, 'r')
-						if (afd) {
-							retriever.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength())
-							afd.close()
-							ok = true
-						}
-					} catch (e2) {}
-				}
-				if (!ok) retriever.setDataSource(uriStr)
-			}
+			retriever.setDataSource(localPath)
 
 			const t = retriever.extractMetadata(7)
 			if (t) title = t
@@ -233,31 +220,30 @@ function resolveUriInfo(uri) {
 		} catch (e) {
 			// 读不到标签就用文件名兜底
 		}
+
+		if (!fileName) {
+			const parts = localPath.split('/')
+			fileName = parts[parts.length - 1] || 'unknown.mp3'
+		}
+
+		if (!title) {
+			const dot = fileName.lastIndexOf('.')
+			title = dot > 0 ? fileName.substring(0, dot) : fileName
+		}
+
+		return {
+			path: localPath,
+			uri: uriStr,
+			name: fileName,
+			title: title,
+			artist: artist || '未知艺术家',
+			album: album || '',
+			duration: duration,
+			size: 0
+		}
 	} catch (e) {
-		console.warn('解析音频信息失败:', e)
-	}
-
-	if (!fileName) {
-		const parts = uriStr.split('/')
-		fileName = decodeURIComponent(parts[parts.length - 1] || 'unknown.mp3')
-	}
-
-	if (!filePath) filePath = uriStr
-
-	if (!title) {
-		const dot = fileName.lastIndexOf('.')
-		title = dot > 0 ? fileName.substring(0, dot) : fileName
-	}
-
-	return {
-		path: filePath,
-		uri: uriStr,
-		name: fileName,
-		title: title,
-		artist: artist || '未知艺术家',
-		album: album || '',
-		duration: duration,
-		size: 0
+		console.error('解析音频信息失败:', e)
+		return null
 	}
 }
 // #endif

@@ -7,11 +7,29 @@
  * 1. 导入时一律把 content:// 文件复制到应用私有目录（长期可用，不依赖 SAF 授权）
  * 2. 复制文件按 URI 哈希命名，避免不同目录下同名文件互相覆盖
  * 3. 保留原始 content:// URI，副本丢失时可重新复制
- * 4. resolveContentUriPath 仅用于读取元数据等一次性场景，不作为长期播放路径
+ * 4. 路径拼接全程使用字符串，不要用 Java 对象构造 File / FileOutputStream
+ *    （5+ 运行时对「对象当构造参数」的桥接不可靠，会静默抛异常）
  */
 
 const AUDIO_DIR = 'audio'
 const MAX_STEM_LENGTH = 32
+
+// 最近一次失败原因，供页面提示用（不含敏感信息）
+let _lastError = ''
+
+function setError(step, e) {
+	const detail = e ? (e.message || String(e)) : ''
+	_lastError = detail ? step + '（' + detail + '）' : step
+	console.error('[content-uri]', _lastError)
+}
+
+function getLastCopyError() {
+	return _lastError
+}
+
+function clearLastCopyError() {
+	_lastError = ''
+}
 
 // #ifdef APP-PLUS
 
@@ -80,50 +98,55 @@ function fileExists(path) {
 	}
 }
 
-function audioDir() {
+/**
+ * 应用私有音频目录（字符串路径，末尾带 /）
+ * 优先 _doc（应用私有文档目录），拿不到再退 Android 的 getFilesDir
+ */
+function audioDirPath() {
+	let base = ''
 	try {
-		const context = appContext()
-		const File = plus.android.importClass('java.io.File')
-		let base = null
-		try {
-			base = context.getExternalFilesDir(null)
-		} catch (e) {}
-		if (!base) base = context.getFilesDir()
-		if (!base) return null
+		base = plus.io.convertLocalFileSystemURL('_doc/')
+	} catch (e) {}
 
-		const dir = new File(base, AUDIO_DIR)
+	if (!base) {
+		try {
+			const file = appContext().getFilesDir()
+			base = plus.android.invoke(file, 'getAbsolutePath') || ''
+		} catch (e) {}
+	}
+
+	if (!base) {
+		setError('无法获取应用私有目录')
+		return ''
+	}
+
+	if (base.charAt(base.length - 1) !== '/') base += '/'
+	const dirPath = base + AUDIO_DIR + '/'
+
+	try {
+		const File = plus.android.importClass('java.io.File')
+		const dir = new File(dirPath)
 		if (!plus.android.invoke(dir, 'exists')) {
 			plus.android.invoke(dir, 'mkdirs')
 		}
-		if (!plus.android.invoke(dir, 'isDirectory')) return base
-		return dir
 	} catch (e) {
-		console.error('[content-uri] 获取应用音频目录失败:', e)
-		return null
+		setError('创建音频目录失败', e)
 	}
-}
 
-function audioDirPath() {
-	const dir = audioDir()
-	if (!dir) return ''
-	try {
-		return plus.android.invoke(dir, 'getAbsolutePath') || ''
-	} catch (e) {
-		return ''
-	}
+	return dirPath
 }
 
 function queryDisplayInfo(resolver, parsedUri) {
 	let name = ''
 	let mime = ''
 	try {
-		const cursor = resolver.query(parsedUri, null, null, null, null)
-		if (cursor && cursor.moveToFirst()) {
-			const nameIdx = cursor.getColumnIndex('_display_name')
-			if (nameIdx >= 0) name = cursor.getString(nameIdx) || ''
-			const mimeIdx = cursor.getColumnIndex('mime_type')
-			if (mimeIdx >= 0) mime = cursor.getString(mimeIdx) || ''
-			cursor.close()
+		const cursor = plus.android.invoke(resolver, 'query', parsedUri, null, null, null, null)
+		if (cursor && plus.android.invoke(cursor, 'moveToFirst')) {
+			const nameIdx = plus.android.invoke(cursor, 'getColumnIndex', '_display_name')
+			if (nameIdx >= 0) name = plus.android.invoke(cursor, 'getString', nameIdx) || ''
+			const mimeIdx = plus.android.invoke(cursor, 'getColumnIndex', 'mime_type')
+			if (mimeIdx >= 0) mime = plus.android.invoke(cursor, 'getString', mimeIdx) || ''
+			plus.android.invoke(cursor, 'close')
 		}
 	} catch (e) {}
 
@@ -140,70 +163,79 @@ function queryDisplayInfo(resolver, parsedUri) {
  * 同一 URI 只会复制一次（按哈希命名，可重复调用）
  */
 function copyToAppDir(uriStr) {
+	clearLastCopyError()
+
 	try {
+		const dirPath = audioDirPath()
+		if (!dirPath) return null
+
 		const resolver = plus.android.runtimeMainActivity().getContentResolver()
 		const Uri = plus.android.importClass('android.net.Uri')
-		const parsedUri = plus.android.invoke(Uri, 'parse', uriStr)
-		const info = queryDisplayInfo(resolver, parsedUri)
-
-		const dir = audioDir()
-		if (!dir) return null
-
-		const File = plus.android.importClass('java.io.File')
-		const target = new File(dir, buildFileName(uriStr, info.name, info.mime))
-		const targetPath = plus.android.invoke(target, 'getAbsolutePath')
-
-		if (fileExists(targetPath)) return targetPath
-		plus.android.invoke(target, 'delete')
-
-		const FileOutputStream = plus.android.importClass('java.io.FileOutputStream')
-		const fos = new FileOutputStream(target)
-
-		try {
-			const input = plus.android.invoke(resolver, 'openInputStream', parsedUri)
-			plus.android.invoke(input, 'transferTo', fos)
-			plus.android.invoke(input, 'close')
-		} catch (e1) {
-			console.warn('[content-uri] transferTo 失败，尝试 FileChannel:', e1)
-			try {
-				const pfd = plus.android.invoke(resolver, 'openFileDescriptor', parsedUri, 'r')
-				const descriptor = plus.android.invoke(pfd, 'getFileDescriptor')
-				const FileInputStream = plus.android.importClass('java.io.FileInputStream')
-				const Long = plus.android.importClass('java.lang.Long')
-				const fis = new FileInputStream(descriptor)
-				const srcChannel = plus.android.invoke(fis, 'getChannel')
-				const dstChannel = plus.android.invoke(fos, 'getChannel')
-				plus.android.invoke(srcChannel, 'transferTo', 0, Long.MAX_VALUE, dstChannel)
-				plus.android.invoke(srcChannel, 'close')
-				plus.android.invoke(dstChannel, 'close')
-				plus.android.invoke(fis, 'close')
-				plus.android.invoke(pfd, 'close')
-			} catch (e2) {
-				console.warn('[content-uri] FileChannel 失败，使用流复制:', e2)
-				const input = plus.android.invoke(resolver, 'openInputStream', parsedUri)
-				const BufferedInputStream = plus.android.importClass('java.io.BufferedInputStream')
-				const BufferedOutputStream = plus.android.importClass('java.io.BufferedOutputStream')
-				const bis = new BufferedInputStream(input, 32768)
-				const bos = new BufferedOutputStream(fos, 32768)
-				let b
-				while ((b = plus.android.invoke(bis, 'read')) !== -1) {
-					plus.android.invoke(bos, 'write', b)
-				}
-				plus.android.invoke(bos, 'flush')
-				plus.android.invoke(bis, 'close')
-				plus.android.invoke(bos, 'close')
-			}
-		}
-		plus.android.invoke(fos, 'close')
-
-		if (!fileExists(targetPath)) {
-			console.error('[content-uri] 复制后文件为空，已删除:', targetPath)
-			plus.android.invoke(target, 'delete')
+		const parsedUri = Uri.parse(uriStr)
+		if (!parsedUri) {
+			setError('无法解析 URI')
 			return null
 		}
+
+		const info = queryDisplayInfo(resolver, parsedUri)
+		const targetPath = dirPath + buildFileName(uriStr, info.name, info.mime)
+
+		if (fileExists(targetPath)) return targetPath
+
+		try {
+			const File = plus.android.importClass('java.io.File')
+			plus.android.invoke(new File(targetPath), 'delete')
+		} catch (e) {}
+
+		try {
+			const FileOutputStream = plus.android.importClass('java.io.FileOutputStream')
+			const fos = new FileOutputStream(targetPath)
+			try {
+				const input = plus.android.invoke(resolver, 'openInputStream', parsedUri)
+				if (!input) {
+					setError('openInputStream 返回空')
+				} else {
+					try {
+						// Android 8.0+ 才有 transferTo
+						plus.android.invoke(input, 'transferTo', fos)
+					} catch (e0) {
+						// 低版本兜底：把 InputStream 转成 Channel 分块搬运
+						const Channels = plus.android.importClass('java.nio.channels.Channels')
+						const ByteBuffer = plus.android.importClass('java.nio.ByteBuffer')
+						const srcChannel = plus.android.invoke(Channels, 'newChannel', input)
+						const dstChannel = plus.android.invoke(fos, 'getChannel')
+						const buffer = plus.android.invoke(ByteBuffer, 'allocate', 65536)
+						let n = plus.android.invoke(srcChannel, 'read', buffer)
+						while (n !== -1) {
+							plus.android.invoke(buffer, 'flip')
+							plus.android.invoke(dstChannel, 'write', buffer)
+							plus.android.invoke(buffer, 'clear')
+							n = plus.android.invoke(srcChannel, 'read', buffer)
+						}
+						plus.android.invoke(srcChannel, 'close')
+						plus.android.invoke(dstChannel, 'close')
+					}
+					plus.android.invoke(input, 'close')
+				}
+			} finally {
+				plus.android.invoke(fos, 'close')
+			}
+		} catch (e1) {
+			setError('写入音频副本失败', e1)
+		}
+
+		if (!fileExists(targetPath)) {
+			try {
+				const File = plus.android.importClass('java.io.File')
+				plus.android.invoke(new File(targetPath), 'delete')
+			} catch (e) {}
+			if (!_lastError) setError('复制后文件为空或不存在')
+			return null
+		}
+
 		return targetPath
 	} catch (e) {
-		console.error('[content-uri] 复制到应用目录失败:', e)
+		setError('复制到应用目录异常', e)
 		return null
 	}
 }
@@ -211,7 +243,7 @@ function copyToAppDir(uriStr) {
 // #endif
 
 /**
- * content:// → 真实文件路径（不复制）
+ * content:// → 真实文件路径（不复制，仅用于读取元数据等一次性场景）
  */
 function resolveContentUriPath(uriStr) {
 	// #ifdef APP-PLUS
@@ -237,25 +269,25 @@ function resolveContentUriPath(uriStr) {
 			const MediaStore = plus.android.importClass('android.provider.MediaStore$Audio$Media')
 			const Uri = plus.android.importClass('android.net.Uri')
 			const mediaUri = Uri.withAppendedPath(MediaStore.EXTERNAL_CONTENT_URI, mediaMatch[1])
-			const cursor = resolver.query(mediaUri, null, null, null, null)
-			if (cursor && cursor.moveToFirst()) {
-				const dataIdx = cursor.getColumnIndex('_data')
+			const cursor = plus.android.invoke(resolver, 'query', mediaUri, null, null, null, null)
+			if (cursor && plus.android.invoke(cursor, 'moveToFirst')) {
+				const dataIdx = plus.android.invoke(cursor, 'getColumnIndex', '_data')
 				if (dataIdx >= 0) {
-					const path = cursor.getString(dataIdx)
+					const path = plus.android.invoke(cursor, 'getString', dataIdx)
 					if (path) {
-						cursor.close()
+						plus.android.invoke(cursor, 'close')
 						return path
 					}
 				}
-				const relIdx = cursor.getColumnIndex('relative_path')
-				const nameIdx = cursor.getColumnIndex('_display_name')
+				const relIdx = plus.android.invoke(cursor, 'getColumnIndex', 'relative_path')
+				const nameIdx = plus.android.invoke(cursor, 'getColumnIndex', '_display_name')
 				if (relIdx >= 0 && nameIdx >= 0) {
-					const relPath = cursor.getString(relIdx) || ''
-					const name = cursor.getString(nameIdx) || ''
-					cursor.close()
+					const relPath = plus.android.invoke(cursor, 'getString', relIdx) || ''
+					const name = plus.android.invoke(cursor, 'getString', nameIdx) || ''
+					plus.android.invoke(cursor, 'close')
 					if (relPath && name) return '/storage/emulated/0/' + relPath + name
 				}
-				cursor.close()
+				plus.android.invoke(cursor, 'close')
 			}
 		} catch (e) {}
 	}
@@ -266,17 +298,17 @@ function resolveContentUriPath(uriStr) {
 			const resolver = plus.android.runtimeMainActivity().getContentResolver()
 			const Uri = plus.android.importClass('android.net.Uri')
 			const dlUri = Uri.parse('content://downloads/public_downloads')
-			const cursor = resolver.query(dlUri, null, '_id=?', [dlMatch[1]], null)
-			if (cursor && cursor.moveToFirst()) {
-				const dataIdx = cursor.getColumnIndex('_data')
+			const cursor = plus.android.invoke(resolver, 'query', dlUri, null, '_id=?', [dlMatch[1]], null)
+			if (cursor && plus.android.invoke(cursor, 'moveToFirst')) {
+				const dataIdx = plus.android.invoke(cursor, 'getColumnIndex', '_data')
 				if (dataIdx >= 0) {
-					const path = cursor.getString(dataIdx)
+					const path = plus.android.invoke(cursor, 'getString', dataIdx)
 					if (path) {
-						cursor.close()
+						plus.android.invoke(cursor, 'close')
 						return path
 					}
 				}
-				cursor.close()
+				plus.android.invoke(cursor, 'close')
 			}
 		} catch (e) {}
 	}
@@ -346,5 +378,6 @@ export {
 	ensureLocalCopy,
 	localFileExists,
 	isManagedCopy,
-	deleteManagedCopy
+	deleteManagedCopy,
+	getLastCopyError
 }
