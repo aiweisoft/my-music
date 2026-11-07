@@ -172,6 +172,7 @@
 		},
 		methods: {
 			_init() {
+				audioManager.validateSongs()
 				this._refreshState()
 				audioManager.on('stateChange', this._onStateChange)
 				audioManager.on('playlistChange', this._onPlaylistChange)

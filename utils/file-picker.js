@@ -5,7 +5,7 @@
  *
  * content:// URI 的解析与落地统一由 content-uri.js 处理。
  */
-import { ensureLocalAudioFile } from './content-uri.js'
+import { ensureLocalCopy, resolveContentUriPath } from './content-uri.js'
 
 export function pickAudioFiles(callback, errorCallback) {
 	// #ifdef APP-PLUS
@@ -105,15 +105,21 @@ function handleActivityResult(requestCode, resultCode, intent) {
 	try {
 		const files = []
 		const clipData = intent.getClipData()
+		const total = clipData ? (() => {
+			try {
+				return clipData.getItemCount()
+			} catch (e) {
+				return plus.android.invoke(clipData, 'getItemCount')
+			}
+		})() : 1
+
+		if (total > 0) {
+			uni.showLoading({ title: '正在导入 0/' + total, mask: true })
+		}
 
 		if (clipData) {
-			let count = 0
-			try {
-				count = clipData.getItemCount()
-			} catch (e) {
-				count = plus.android.invoke(clipData, 'getItemCount')
-			}
-			for (let i = 0; i < count; i++) {
+			for (let i = 0; i < total; i++) {
+				uni.showLoading({ title: '正在导入 ' + (i + 1) + '/' + total, mask: true })
 				let item
 				try {
 					item = clipData.getItemAt(i)
@@ -131,8 +137,10 @@ function handleActivityResult(requestCode, resultCode, intent) {
 			}
 		}
 
+		uni.hideLoading()
 		if (callback) callback(files)
 	} catch (e) {
+		uni.hideLoading()
 		console.error('处理文件选择结果失败:', e)
 		if (errorCallback) errorCallback(e)
 	}
@@ -178,9 +186,14 @@ function resolveUriInfo(uri) {
 			}
 		} catch (e) {}
 
-		// 统一由 content-uri.js 决定「直接用真实路径」还是「复制到应用私有目录」
-		const local = ensureLocalAudioFile(uriStr)
-		if (local) filePath = local
+		// 一律复制到应用私有目录：副本只依赖应用自身存储，重启后依然可播
+		const local = ensureLocalCopy(uriStr)
+		if (local) {
+			filePath = local
+		} else {
+			const resolved = resolveContentUriPath(uriStr)
+			if (resolved) filePath = resolved
+		}
 
 		try {
 			const MMR = plus.android.importClass('android.media.MediaMetadataRetriever')

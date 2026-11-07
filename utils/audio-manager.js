@@ -1,4 +1,4 @@
-﻿import { ensureLocalAudioFile } from './content-uri.js'
+﻿import { ensureLocalCopy, localFileExists, isManagedCopy, deleteManagedCopy } from './content-uri.js'
 
 const STORAGE_KEY = 'music_playlists'
 const STORAGE_ACTIVE_KEY = 'music_active_playlist'
@@ -15,6 +15,7 @@ class AudioManager {
 		this.playMode = 0
 		this._ctx = null
 		this._listeners = {}
+		this._repairedIds = {}
 
 		this._loadFromStorage()
 	}
@@ -164,7 +165,7 @@ class AudioManager {
 		const ap = this.activePlaylist
 		if (!ap || index < 0 || index >= ap.songs.length) return false
 		const wasCurrent = ap.currentIndex === index
-		ap.songs.splice(index, 1)
+		const removed = ap.songs.splice(index, 1)[0]
 
 		if (ap.songs.length === 0) {
 			ap.currentIndex = -1
@@ -176,6 +177,7 @@ class AudioManager {
 			ap.currentIndex--
 		}
 
+		this._releaseSongFile(removed)
 		this._saveToStorage()
 		this._emit('playlistChange')
 		return true
@@ -188,13 +190,14 @@ class AudioManager {
 		const pl = this.playlists[playlistIndex]
 		if (!pl || songIndex < 0 || songIndex >= pl.songs.length) return false
 
-		pl.songs.splice(songIndex, 1)
+		const removed = pl.songs.splice(songIndex, 1)[0]
 		if (pl.songs.length === 0) {
 			pl.currentIndex = -1
 		} else if (pl.currentIndex > songIndex) {
 			pl.currentIndex--
 		}
 
+		this._releaseSongFile(removed)
 		this._saveToStorage()
 		this._emit('playlistChange')
 		return true
@@ -203,9 +206,11 @@ class AudioManager {
 	clearCurrent() {
 		const ap = this.activePlaylist
 		if (!ap) return
+		const removed = ap.songs
 		ap.songs = []
 		ap.currentIndex = -1
 		this.stop()
+		removed.forEach(song => this._releaseSongFile(song))
 		this._saveToStorage()
 		this._emit('playlistChange')
 	}
@@ -217,10 +222,24 @@ class AudioManager {
 		}
 		const pl = this.playlists[index]
 		if (!pl) return
+		const removed = pl.songs
 		pl.songs = []
 		pl.currentIndex = -1
+		removed.forEach(song => this._releaseSongFile(song))
 		this._saveToStorage()
 		this._emit('playlistChange')
+	}
+
+	/**
+	 * 删除歌曲时顺带清理复制出来的副本文件（其它歌单还在引用则保留）
+	 */
+	_releaseSongFile(song) {
+		if (!song || !song.path) return
+		// #ifdef APP-PLUS
+		const stillUsed = this.playlists.some(pl => pl.songs.some(s => s !== song && s.path === song.path))
+		if (stillUsed) return
+		deleteManagedCopy(song.path)
+		// #endif
 	}
 
 	// ===== 播放控制 =====
@@ -266,9 +285,28 @@ class AudioManager {
 		})
 		this._ctx.onError((err) => {
 			const curSong = this.getCurrentSong()
-			console.error('音频播放错误:', JSON.stringify(err), '路径:', curSong ? curSong.path : 'unknown')
+			console.error('音频播放错误:', JSON.stringify(err),
+				'uri:', curSong ? curSong.uri : 'unknown',
+				'path:', curSong ? curSong.path : 'unknown')
 			this.isPlaying = false
 			this._emit('error', err)
+
+			// 副本损坏/不完整时，删掉重新复制一次再试（每首歌每次运行只尝试一次）
+			// #ifdef APP-PLUS
+			if (curSong && curSong.uri && !this._repairedIds[curSong.id]) {
+				this._repairedIds[curSong.id] = true
+				if (isManagedCopy(curSong.path)) {
+					deleteManagedCopy(curSong.path)
+				}
+				const copy = ensureLocalCopy(curSong.uri)
+				if (copy) {
+					curSong.path = copy
+					this._saveToStorage()
+					this.play()
+					return
+				}
+			}
+			// #endif
 
 			const ap = this.activePlaylist
 			if (!ap || ap.songs.length <= 1) return
@@ -301,31 +339,75 @@ class AudioManager {
 	play(index) {
 		const ap = this.activePlaylist
 		if (!ap) return
-		if (index !== undefined && index >= 0 && index < ap.songs.length) {
+		const explicit = index !== undefined && index >= 0 && index < ap.songs.length
+		if (explicit) {
 			ap.currentIndex = index
 			this._consecutiveErrors = 0
 		}
 		if (ap.currentIndex < 0 || ap.songs.length === 0) return
 
 		const song = ap.songs[ap.currentIndex]
+		const path = this._ensurePlayable(song)
 
-		// #ifdef APP-PLUS
-		const playable = ensureLocalAudioFile(song.uri || song.path)
-		if (playable) {
-			if (playable !== song.path) {
-				song.path = playable
-				this._saveToStorage()
+		if (!path) {
+			// 文件彻底找不到：标记失效并跳过，避免无限重试导致反复弹提示
+			song.broken = true
+			if (explicit) {
+				this._emit('playlistChange')
+				uni.showToast({ title: '该歌曲文件已失效，请重新导入', icon: 'none' })
+				return
 			}
-		} else {
-			console.warn('[play] 无法获取可播放路径:', song.uri || song.path)
+			this._consecutiveErrors = (this._consecutiveErrors || 0) + 1
+			if (this._consecutiveErrors >= ap.songs.length) {
+				this._consecutiveErrors = 0
+				this.isPlaying = false
+				this.currentTime = 0
+				this._emit('stateChange')
+				this._emit('playlistChange')
+				uni.showToast({ title: '歌曲文件已失效，请清空后重新导入', icon: 'none', duration: 2500 })
+				return
+			}
+			this._next()
+			return
 		}
-		// #endif
+
+		if (path !== song.path) {
+			song.path = path
+			this._saveToStorage()
+		}
+		if (song.broken) {
+			song.broken = false
+			this._emit('playlistChange')
+		}
 
 		this._createContext()
-		this._ctx.src = song.path
+		this._ctx.src = path
 		this._ctx.play()
 		this._saveToStorage()
 		this._emit('trackChange')
+	}
+
+	/**
+	 * 取当前歌曲真正可用的播放路径
+	 * 副本存在就直接用；副本丢失但有原始 URI 就重新复制一次
+	 */
+	_ensurePlayable(song) {
+		// #ifdef APP-PLUS
+		if (!song) return null
+		if (song.path && song.path.indexOf('content://') !== 0 && localFileExists(song.path)) {
+			return song.path
+		}
+		if (song.uri) {
+			const copy = ensureLocalCopy(song.uri)
+			if (copy) {
+				console.log('[play] 已从原始 URI 恢复文件:', song.uri, '→', copy)
+				return copy
+			}
+		}
+		console.warn('[play] 无法获取可播放路径:', song.uri || song.path)
+		return null
+		// #endif
+		return song ? song.path : null
 	}
 
 	pause() {
@@ -414,6 +496,27 @@ class AudioManager {
 		const ap = this.activePlaylist
 		if (!ap || ap.currentIndex < 0 || ap.currentIndex >= ap.songs.length) return null
 		return ap.songs[ap.currentIndex]
+	}
+
+	/**
+	 * 校验歌单里每首歌的本地文件是否还在，返回失效数量
+	 * 只做存在性检查，不触发复制；播放时会自动尝试从原始 URI 恢复
+	 */
+	validateSongs() {
+		// #ifdef APP-PLUS
+		let broken = 0
+		for (const pl of this.playlists) {
+			for (const song of pl.songs) {
+				const path = song.path || ''
+				const ok = path && path.indexOf('content://') !== 0 && localFileExists(path)
+				if (!ok) broken++
+				song.broken = !ok
+			}
+		}
+		if (broken > 0) this._emit('playlistChange')
+		return broken
+		// #endif
+		return 0
 	}
 
 	getProgress() {

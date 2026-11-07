@@ -176,21 +176,25 @@ HBuilderX → 发行 → 原生 App-云打包 / 小程序-微信。输出目录 
 ```js
 {
   id, title, artist, album, duration, size,
-  uri:  'content://...',   // 原始 URI，永久有效，用于恢复
-  path: '/storage/...'     // 当前可用路径，可能失效，可被覆盖
+  uri:   'content://...',                                // 原始 URI，用于重新复制
+  path:  '.../Android/data/<包名>/files/audio/xxx.mp3',   // 应用私有副本，长期可用
+  broken: false                                          // 运行时标记：副本丢失
 }
 ```
 
-**铁律：不允许把临时/缓存路径写回 `song.uri`。** 曾经的 bug 是把 `song.path` 覆盖成 `getCacheDir()` 里的副本并持久化，用户清理缓存后整个歌单全部失效。
+**铁律：导入时一律把 content:// 复制到应用私有目录，`path` 永远指向副本，绝不长期引用原路径。**
 
-#### `ensureLocalAudioFile(uriStr)` 的决策流程
+曾经的做法是「原路径能读就直接用」，结果真机出现：**添加后当场能播，彻底退出进程再进来全部播放失败**。原因是原路径的可读性依赖 SAF 的临时授权（进程级），进程一死授权就没了，而存下来的路径仍被当成有效路径直接交给播放器。现在的策略把这条依赖彻底去掉。
 
-1. 非 content:// 的普通路径 → `fileExists()` 为真就原样返回，否则返回 `null`；
-2. content:// → 先 `resolveContentUriPath()` 解析真实路径；
-3. 真实路径**存在且可读**（用 `FileInputStream` 实际打开验证，不是只看 `exists()`）→ 直接用，不复制；
-4. 解析不出 / 无权限读 → `copyToAppDir()` 复制到应用私有目录。
+**也不允许把副本路径写回 `song.uri`**，`uri` 必须保留原始 content://，否则副本丢失后无法恢复。
 
-> 为什么必须做「可读性探测」：SAF 授权拿到的 content:// 能读，但不代表同路径的文件路径也能读（没有 `READ_MEDIA_AUDIO` 时 `/storage/emulated/0/...` 会抛异常）。
+#### `ensureLocalCopy(uriStr)`：导入/播放时统一用它
+
+1. 普通本地路径 → 存在就原样返回，不复制；
+2. content:// → `copyToAppDir()` 复制到应用私有目录，已复制过则直接复用（按 URI 哈希命名）；
+3. 返回 `null` 表示拿不到可播文件，调用方必须按「文件失效」处理，**不能继续把无效路径交给播放器**。
+
+`resolveContentUriPath()` 仍保留，但只用于「读元数据」这类一次性场景，**不能再作为长期播放路径**。
 
 #### 复制目录与命名
 
@@ -199,6 +203,9 @@ HBuilderX → 发行 → 原生 App-云打包 / 小程序-微信。输出目录 
 - 文件名：`hashString(uriStr) + '_' + 清洗后的原名 + '.' + 扩展名`，扩展名从 `_display_name` 取，取不到按 mime 映射。
 - **绝对不要直接拿 `_display_name` 当文件名**：不同目录下同名的 `01.mp3` 会命中同一份缓存，播放时放的是别人的歌。
 - 同一 URI 重复调用只会复制一次（同名同哈希直接复用）。
+- 删除歌曲/清空歌单时通过 `_releaseSongFile()` 清理副本（其它歌单仍引用则保留），避免副本堆积。
+
+> 代价：导入后文件会存两份（原文件 + 应用副本），存储占用翻倍。这是用空间换「重启后一定能播」的确定性，改策略前先确认能接受。
 
 #### URI 形态与解析规则
 
@@ -249,8 +256,9 @@ HBuilderX → 发行 → 原生 App-云打包 / 小程序-微信。输出目录 
 |-----|------|
 | `createPlaylist / renamePlaylist / deletePlaylist / setActivePlaylist` | 歌单 CRUD（至少保留一个歌单） |
 | `addSongs(files) / addSongsAt(index, files)` | 加歌，返回实际新增数量（自动去重） |
-| `removeSong(index) / removeSongAt(plIndex, songIndex)` | 删歌，自动修正 `currentIndex` |
-| `clearCurrent() / clearPlaylistAt(index)` | 清空歌单 |
+| `removeSong(index) / removeSongAt(plIndex, songIndex)` | 删歌，自动修正 `currentIndex`，并清理无引用的副本 |
+| `clearCurrent() / clearPlaylistAt(index)` | 清空歌单（同时清理副本） |
+| `validateSongs()` | 启动时校验副本是否还在，标记 `song.broken`，返回失效数量 |
 | `play(index) / pause() / toggle() / stop() / next() / prev() / seek(sec)` | 播放控制 |
 | `switchPlayMode()` | 0→1→2 循环，并持久化 |
 | `release()` | 停止并销毁播放器（「清理缓存」按钮用） |
@@ -271,13 +279,16 @@ HBuilderX → 发行 → 原生 App-云打包 / 小程序-微信。输出目录 
 
 ### 5.7 错误处理与自愈
 
-`onError` 的既定策略：
+播放失败的既定策略（**不要在别处再写一套**）：
 
-1. `console.error` 里必须打出**当前歌曲路径**（排查 content:// 问题的唯一线索）；
-2. `isPlaying = false` 并 `_emit('error', err)`；
-3. 歌单只有 1 首、或单曲循环模式 → 不自动跳过；
-4. 否则 300ms 后 `_next()` 自动跳下一首；
-5. `_consecutiveErrors` 累计到歌单长度就停止并 toast「播放失败，请检查音频文件」，`onPlay` 时清零（避免整张歌单都是坏文件时无限刷）。
+1. `play()` 前置校验：`_ensurePlayable()` 拿不到路径 → 标记 `song.broken`，计入连续失败并 `_next()` 跳过；**绝不把无效路径交给播放器**；
+2. 跳完整个歌单仍无可播文件 → 停播 + **只弹一次** toast「歌曲文件已失效，请清空后重新导入」，避免每次点播放都循环提示；
+3. `onError` 里先尝试自愈：若 `song.path` 是应用私有副本，删掉它并按原始 `uri` 重新复制一次再播（每首歌每次运行只重试一次，见 `_repairedIds`）；
+4. 自愈无效再按「歌单只有 1 首 / 单曲循环 → 不跳，否则 300ms 后 `_next()`」处理；
+5. `_consecutiveErrors` 累计到歌单长度就停止并提示，`onPlay` 时清零；
+6. 日志必须同时打出 `uri` 和 `path`，否则无法判断是「路径错」还是「文件坏」。
+
+歌单页会把 `song.broken` 显示为「文件已失效，请重新导入」。
 
 ### 5.8 进度条交互细节
 
@@ -306,6 +317,8 @@ HBuilderX → 发行 → 原生 App-云打包 / 小程序-微信。输出目录 
 - [ ] 是否只通过 `audioManager` 的公开 API 操作？
 - [ ] 新字段是否同时兼容老数据（缺 `uri` 的老歌不能崩）？
 - [ ] 有没有把临时路径写回 `song.uri` 或长期保存？
+- [ ] 新导入的歌曲 `path` 是否指向应用私有副本（而不是原始共享路径）？
+- [ ] 拿到 `null` 路径时是否按「文件失效」处理，而不是硬播？
 - [ ] 有没有重复实现 content:// 解析（应调用 `content-uri.js`）？
 - [ ] `_next` 的 `auto` 语义是否保持（自动 vs 手动）？
 - [ ] 新增事件是否在 `_removeListeners()` 里配套 `off`？

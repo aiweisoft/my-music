@@ -1,12 +1,13 @@
 /**
- * Android content:// URI 工具（App 平台）
+ * Android content:// 工具（App 平台）
  * - 供 file-picker.js / audio-manager.js 共用，避免两处重复实现
  * - 非 App 平台统一返回 null，调用方按「路径不可用」处理
  *
  * 设计要点：
- * 1. 优先把 content:// 解析成真实文件路径（externalstorage / MediaStore / Downloads）
- * 2. 解析不出或应用无读取权限时，复制到应用私有目录（不是缓存目录，不会被系统清理）
- * 3. 复制文件按 URI 哈希命名，避免不同目录下同名文件互相覆盖
+ * 1. 导入时一律把 content:// 文件复制到应用私有目录（长期可用，不依赖 SAF 授权）
+ * 2. 复制文件按 URI 哈希命名，避免不同目录下同名文件互相覆盖
+ * 3. 保留原始 content:// URI，副本丢失时可重新复制
+ * 4. resolveContentUriPath 仅用于读取元数据等一次性场景，不作为长期播放路径
  */
 
 const AUDIO_DIR = 'audio'
@@ -79,18 +80,6 @@ function fileExists(path) {
 	}
 }
 
-function isReadable(path) {
-	if (!path) return false
-	try {
-		const FileInputStream = plus.android.importClass('java.io.FileInputStream')
-		const stream = new FileInputStream(path)
-		plus.android.invoke(stream, 'close')
-		return true
-	} catch (e) {
-		return false
-	}
-}
-
 function audioDir() {
 	try {
 		const context = appContext()
@@ -111,6 +100,16 @@ function audioDir() {
 	} catch (e) {
 		console.error('[content-uri] 获取应用音频目录失败:', e)
 		return null
+	}
+}
+
+function audioDirPath() {
+	const dir = audioDir()
+	if (!dir) return ''
+	try {
+		return plus.android.invoke(dir, 'getAbsolutePath') || ''
+	} catch (e) {
+		return ''
 	}
 }
 
@@ -288,11 +287,24 @@ function resolveContentUriPath(uriStr) {
 }
 
 /**
- * 保证拿到一个当前可播放的本地路径
- * - 普通路径：存在即可用，否则返回 null
- * - content://：能直接读就用原文件，读不了就复制到应用私有目录
+ * 文件是否真实存在且非空（仅 App 平台有效）
  */
-function ensureLocalAudioFile(uriStr) {
+function localFileExists(path) {
+	// #ifdef APP-PLUS
+	return fileExists(path)
+	// #endif
+	return false
+}
+
+/**
+ * 保证 content:// 音频在应用私有目录里有一份长期可用的副本
+ * - 传入普通本地路径：存在则原样返回，不复制
+ * - 传入 content://：复制到应用私有目录（已复制过则直接复用）
+ *
+ * 之所以一律复制而不是直接用原文件路径：SAF 的授权只在当前进程有效，
+ * 进程被彻底退出后原路径可能就不可读了，而副本只依赖应用自己的存储。
+ */
+function ensureLocalCopy(uriStr) {
 	// #ifdef APP-PLUS
 	if (!uriStr) return null
 	if (!plus.android) return null
@@ -300,15 +312,39 @@ function ensureLocalAudioFile(uriStr) {
 	if (uriStr.indexOf('content://') !== 0) {
 		return fileExists(uriStr) ? uriStr : null
 	}
-
-	const resolved = resolveContentUriPath(uriStr)
-	if (resolved && fileExists(resolved) && isReadable(resolved)) {
-		return resolved
-	}
-
 	return copyToAppDir(uriStr)
 	// #endif
 	return null
 }
 
-export { resolveContentUriPath, ensureLocalAudioFile }
+/**
+ * 路径是否为本模块复制出来的副本（用于删除时判断能否清理）
+ */
+function isManagedCopy(path) {
+	// #ifdef APP-PLUS
+	const dir = audioDirPath()
+	return !!(dir && path && path.indexOf(dir) === 0)
+	// #endif
+	return false
+}
+
+/**
+ * 删除本模块复制出来的副本文件（外部路径不会被删除）
+ */
+function deleteManagedCopy(path) {
+	// #ifdef APP-PLUS
+	if (!isManagedCopy(path)) return
+	try {
+		const File = plus.android.importClass('java.io.File')
+		plus.android.invoke(new File(path), 'delete')
+	} catch (e) {}
+	// #endif
+}
+
+export {
+	resolveContentUriPath,
+	ensureLocalCopy,
+	localFileExists,
+	isManagedCopy,
+	deleteManagedCopy
+}

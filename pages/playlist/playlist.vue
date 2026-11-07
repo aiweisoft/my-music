@@ -65,7 +65,8 @@
 				</view>
 				<view class="song-meta">
 					<text class="song-name" :class="{ 'playing-text': isActiveSong(tabIndex, si) }">{{ song.title }}</text>
-					<text class="song-info-text">{{ song.album ? song.artist + ' · ' + song.album : song.artist }}</text>
+					<text v-if="song.broken" class="song-info-text broken-text">文件已失效，请重新导入</text>
+					<text v-else class="song-info-text">{{ song.album ? song.artist + ' · ' + song.album : song.artist }}</text>
 				</view>
 				<view class="song-status">
 					<text v-if="isActiveSong(tabIndex, si) && isPlaying" class="playing-indicator"></text>
@@ -97,6 +98,7 @@
 			}
 		},
 		onShow() {
+			audioManager.validateSongs()
 			this._refresh()
 		},
 		onLoad() {
@@ -608,6 +610,10 @@
 		color: #8a8f98;
 		margin-top: 4rpx;
 		display: block;
+	}
+
+	.broken-text {
+		color: #e17055;
 	}
 
 	.song-status {
